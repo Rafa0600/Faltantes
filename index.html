@@ -5,12 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#ffe600">
 <title>Faltantes</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" href="icon-192.png">
 <style>
   :root { --bg:#f2f3f5; --card:#fff; --tx:#1d1d1f; --mut:#6b7280; --bd:#e3e5e8; --az:#3483fa; --ok:#2e7d32; --mal:#c62828; --am:#ffe600; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--tx); font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
   header { background:var(--am); padding:14px 16px; font-weight:700; font-size:20px; display:flex; align-items:center; gap:10px; position:sticky; top:0; z-index:5; }
   header small { font-weight:400; font-size:13px; color:#555; margin-left:auto; }
+  header button + small { margin-left:0; }
   main { max-width:640px; margin:0 auto; padding:14px 16px 60px; }
   .card { background:var(--card); border-radius:14px; padding:14px; margin-bottom:12px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
   .fila { display:flex; gap:8px; flex-wrap:wrap; }
@@ -41,7 +45,7 @@
 </style>
 </head>
 <body>
-<header>📦 Faltantes <small id="nube">☁</small></header>
+<header>📦 Faltantes <button id="instalar" style="display:none;margin-left:auto;padding:7px 12px;font-size:14px;background:#1d1d1f;color:#fff">⬇ Instalar app</button><small id="nube">☁</small></header>
 <main>
   <div class="card">
     <div class="fila">
@@ -100,13 +104,23 @@ function extraer(txt) {
     .replace(/(?<=\d)[Oo]|[Oo](?=\d)/g, '0').replace(/(?<=\d)[lI|]|[lI|](?=\d)/g, '1')
     .replace(/(?<=\d)S|S(?=\d)/g, '5').replace(/(?<=\d)B|B(?=\d)/g, '8');
   const out = [];
-  for (const m of t.matchAll(/\d[\d  .]{8,16}\d/g)) {
-    const d = m[0].replace(/\D/g, '');
-    if (d.length === 11) out.push(d);
-    else if (d.length === 12) out.push(d.slice(1));      // el "#" de adelante leído como 7 / 4 / 1
-    else if (d.length > 11 && d.length % 11 === 0) for (let i = 0; i < d.length; i += 11) out.push(d.slice(i, i + 11));
+  // por línea, los "pedazos" de dígitos (el lector a veces mete espacios: "48517 745499");
+  // se juntan pedazos seguidos hasta llegar justo a 11. Así "48481280636 16 nov" da el envío
+  // y no se pega con el 16 de la fecha.
+  for (const linea of t.split(/\n/)) {
+    const g = linea.split(/[^\d]+/).filter(Boolean);
+    for (let i = 0; i < g.length; i++) {
+      if (g[i].length === 12) { out.push(g[i].slice(1)); continue; }   // el "#" leído como 7 / 4 / 1
+      if (g[i].length > 12 && g[i].length % 11 === 0) { for (let k = 0; k < g[i].length; k += 11) out.push(g[i].slice(k, k + 11)); continue; }
+      let s = '';
+      for (let j = i; j < g.length && s.length < 11; j++) {
+        s += g[j];
+        if (s.length === 11) { out.push(s); i = j; break; }
+      }
+    }
   }
-  return out;
+  // los nº de envío de ML empiezan con 4 (lo demás: devoluciones "M000…", lecturas falladas)
+  return [...new Set(out)].filter(n => /^4\d{10}$/.test(n));
 }
 function agregar(lista) {
   let n = 0;
@@ -164,35 +178,60 @@ function cargarTesseract() {
   return tesseractListo;
 }
 // agranda, pasa a gris y sube el contraste: con reflejos lee mucho mejor
-function prepararImagen(file) {
+function abrirImagen(file) {
   return new Promise((res, rej) => {
     const img = new Image();
-    img.onload = () => {
-      const max = 2000, k = Math.min(1, max / Math.max(img.width, img.height)) * (Math.max(img.width, img.height) < 1200 ? 2 : 1);
-      const c = document.createElement('canvas');
-      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
-      const g = c.getContext('2d');
-      g.filter = 'grayscale(1) contrast(1.6) brightness(1.05)';
-      g.drawImage(img, 0, 0, c.width, c.height);
-      res(c);
-    };
+    img.onload = () => res(img);
     img.onerror = () => rej(new Error('No pude abrir la imagen'));
     img.src = URL.createObjectURL(file);
   });
 }
+function variante(img, filtro, escala) {
+  const lado = Math.max(img.width, img.height);
+  const k = Math.min(escala, 2400 / lado);
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+  const g = c.getContext('2d');
+  g.filter = filtro;
+  g.drawImage(img, 0, 0, c.width, c.height);
+  return c;
+}
+async function prepararImagen(file) {   // (se usa en pruebas)
+  return variante(await abrirImagen(file), 'grayscale(1) contrast(1.6) brightness(1.05)', 2);
+}
+// ¿difiere en 1 solo dígito? (mismo número mal leído en otra pasada)
+const casiIgual = (a, b) => { let d = 0; for (let i = 0; i < 11; i++) if (a[i] !== b[i] && ++d > 1) return false; return d === 1; };
 async function leerFoto(file) {
   if (!file) return;
   $('#foto').src = URL.createObjectURL(file); $('#foto').style.display = 'block';
   try {
     estado('Cargando el lector… (la primera vez tarda un poco)', 0);
     await cargarTesseract();
-    const canvas = await prepararImagen(file);
+    const img = await abrirImagen(file);
+    // varias pasadas (contraste, original, más grande y nítida) y se juntan los resultados:
+    // lo que una pasada no ve (reflejo, foto torcida) lo ve otra
+    const pasadas = [
+      ['grayscale(1) contrast(1.6) brightness(1.05)', 2],
+      ['none', 1],
+      ['grayscale(1) contrast(2.4) brightness(1.15)', 2.4],
+    ];
+    let paso = 0;
     const worker = await Tesseract.createWorker('eng', 1, {
-      logger: (m) => { if (m.status === 'recognizing text') estado('Leyendo la foto…', m.progress); },
+      logger: (m) => { if (m.status === 'recognizing text') estado('Leyendo la foto… (' + (paso + 1) + '/' + pasadas.length + ')', (paso + m.progress) / pasadas.length); },
     });
-    const { data } = await worker.recognize(canvas);
+    const vistos = new Map();                       // número → en cuántas pasadas salió
+    for (; paso < pasadas.length; paso++) {
+      const [f, e] = pasadas[paso];
+      const { data } = await worker.recognize(variante(img, f, e));
+      extraer(data.text).forEach(n => vistos.set(n, (vistos.get(n) || 0) + 1));
+    }
     await worker.terminate();
-    const l = extraer(data.text);
+    // si dos lecturas difieren en 1 dígito, queda la que salió en más pasadas
+    const orden = [...vistos.keys()];                // orden en que aparecen en la foto
+    const ganan = [...vistos.entries()].sort((a, b) => b[1] - a[1]);
+    const elegidos = [];
+    for (const [n] of ganan) if (!elegidos.some(x => casiIgual(x, n))) elegidos.push(n);
+    const l = orden.filter(n => elegidos.includes(n));
     if (!l.length) { estado('⚠ No encontré números de 11 dígitos. Probá otra foto (más cerca, sin reflejo) o escribilos.'); return; }
     const n = agregar(l);
     estado('✓ Encontré ' + l.length + ' número' + (l.length === 1 ? '' : 's') + (n < l.length ? ' (' + (l.length - n) + ' ya estaban)' : '') + '. Revisalos con la foto y tocá Buscar.');
@@ -277,6 +316,16 @@ $('#guardarClave').onclick = () => { ls.set('flt-clave', $('#clave').value.trim(
 
 pintarNums();
 if (ULT) pintarRes();
+
+/* ---------- instalar como app ---------- */
+if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('./sw.js').catch(() => {});
+let pedidoInstalar = null;
+window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); pedidoInstalar = e; $('#instalar').style.display = ''; });
+window.addEventListener('appinstalled', () => { $('#instalar').style.display = 'none'; });
+$('#instalar').onclick = async () => {
+  if (!pedidoInstalar) return;
+  pedidoInstalar.prompt(); await pedidoInstalar.userChoice; pedidoInstalar = null; $('#instalar').style.display = 'none';
+};
 </script>
 </body>
 </html>
