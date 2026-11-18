@@ -1,7 +1,7 @@
 // Mikra Faltantes — service worker (para poder instalarla como app)
 // La página SIEMPRE se baja de internet (así nunca queda una versión vieja);
 // la copia guardada se usa solo si no hay conexión. La nube (workers.dev) y el lector de fotos (jsdelivr) no se tocan.
-const CACHE = 'mikra-faltantes-v2';
+const CACHE = 'mikra-faltantes-v3';
 const ARCHIVOS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {

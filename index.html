@@ -43,6 +43,10 @@
   .fila .h { font-size:13px; color:var(--mut); white-space:nowrap; }
   .fila .h b { color:var(--tx); }
   .fila.no .h { color:var(--mal); }
+  .fila.dud { background:#fff4e5; margin:0 -14px; padding:7px 14px; }
+  .fila.dud .n { color:#e65100; text-decoration:underline dotted; }
+  .fila .si { border:0; background:#e65100; color:#fff; border-radius:8px; padding:4px 8px; font:700 12px system-ui,sans-serif; }
+  .fila .n { cursor:pointer; }
   .fila .x { border:0; background:none; color:#9ca3af; font-size:16px; padding:2px 4px; }
   .vacio { color:var(--mut); text-align:center; padding:14px 0 4px; font-size:14px; }
   .pie { position:fixed; left:0; right:0; bottom:0; background:rgba(242,243,245,.96); padding:10px 16px calc(10px + env(safe-area-inset-bottom)); display:flex; gap:8px; justify-content:center; border-top:1px solid var(--bd); }
@@ -83,6 +87,7 @@ const clave = () => ls.get('flt-clave', '');
 let NUMS = ls.get('flt-nums', []);          // envíos y devoluciones, en orden
 let INFO = ls.get('flt-info', {});          // id → {t, r, prov} de la nube
 let FOTOS = ls.get('flt-fotos', []);        // [{src (jpg chico), n}]
+let DUD = ls.get('flt-dud', []);            // leídos en una sola lectura: a revisar con la foto
 const esValido = (n) => /^4\d{10}$/.test(n) || /^M\d{10}MLA$/.test(n);
 const esDev = (n) => n[0] === 'M';
 
@@ -157,42 +162,68 @@ async function leerUna(file, iFoto, nFotos) {
   if (!worker) worker = await Tesseract.createWorker('eng', 1, {
     logger: (m) => { if (m.status === 'recognizing text') estado(leyendoTxt, false, (paso + m.progress) / PASADAS.length); },
   });
-  // varias pasadas y se juntan: lo que una no ve (reflejo, foto torcida) lo ve otra
+  // 4 lecturas distintas (2 normales + 2 que solo aceptan números, # y MLA) y se VOTA:
+  // un número cuenta como seguro solo si salió igual en 2 o más lecturas
   const vistos = new Map();
+  let soloNums = false;
   for (paso = 0; paso < PASADAS.length; paso++) {
     leyendoTxt = 'Leyendo foto' + (nFotos > 1 ? ' ' + (iFoto + 1) + ' de ' + nFotos : '') + '…';
-    const [f, e] = PASADAS[paso];
+    const [f, e, w] = PASADAS[paso];
+    if (!!w !== soloNums) { soloNums = !!w; await worker.setParameters({ tessedit_char_whitelist: w ? '0123456789#MLA' : '' }); }
     const { data } = await worker.recognize(variante(img, f, e));
     extraer(data.text).forEach(n => vistos.set(n, (vistos.get(n) || 0) + 1));
   }
-  const orden = [...vistos.keys()];
-  const elegidos = [];
-  for (const [n] of [...vistos.entries()].sort((a, b) => b[1] - a[1])) if (!elegidos.some(x => casiIgual(x, n))) elegidos.push(n);
-  const l = orden.filter(n => elegidos.includes(n));
+  if (soloNums) await worker.setParameters({ tessedit_char_whitelist: '' });
+  // lecturas parecidas (hasta 2 caracteres distintos) = el mismo número mal leído: gana el más votado
+  const orden = [...vistos.keys()], grupos = [];
+  for (const [n, v] of [...vistos.entries()].sort((a, b) => b[1] - a[1])) {
+    const g = grupos.find(x => distancia(x.n, n) <= 2);
+    if (g) g.votos += v; else grupos.push({ n, votos: v, propio: v });
+  }
+  const l = [], dudosos = [];
+  orden.forEach(n => { const g = grupos.find(x => x.n === n); if (!g) return; l.push(n); if (g.propio < 2) dudosos.push(n); });
   const foto = FOTOS[FOTOS.length - 1];
   foto.leyendo = false; foto.n = l.length; foto.ids = l;
-  return l;
+  return { l, dudosos };
 }
+const distancia = (a, b) => { if (a.length !== b.length) return 99; let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
 const PASADAS = [
   ['grayscale(1) contrast(1.6) brightness(1.05)', 2],
   ['none', 1],
-  ['grayscale(1) contrast(2.4) brightness(1.15)', 2.4],
+  ['grayscale(1) contrast(1.6) brightness(1.05)', 2, true],
+  ['grayscale(1) contrast(2.4) brightness(1.15)', 2.4, true],
 ];
+// un envío cuyo comienzo no se parece a ningún otro de la lista (ej. 41… o 49… entre todos 48…) → a revisar
+function rarosPorPrefijo() {
+  const env = NUMS.filter(n => !esDev(n));
+  if (env.length < 3) return [];
+  return env.filter(n => !env.some(x => x !== n && x.slice(0, 2) === n.slice(0, 2)));
+}
 let paso = 0, leyendoTxt = '';
 function leerFotos(files) {
   files = [...files]; if (!files.length) return;
   cola = cola.then(async () => {
+    // una lista de hace más de 2 horas es de otra colecta: se empieza de cero (si no, se mezclaban)
+    let aviso = '';
+    const ult = ls.get('flt-ult', 0);
+    if (NUMS.length && Date.now() - ult > 2 * 3600000) {
+      NUMS = []; INFO = {}; FOTOS = []; DUD = []; aviso = 'Lista nueva (la anterior era de otra colecta) · ';
+    }
+    ls.set('flt-ult', Date.now());
     let nuevos = 0, leidos = 0;
     for (let i = 0; i < files.length; i++) {
       try {
-        const l = await leerUna(files[i], i, files.length);
+        const { l, dudosos } = await leerUna(files[i], i, files.length);
         leidos += l.length;
-        for (const x of l) if (!NUMS.includes(x)) { NUMS.push(x); nuevos++; }
+        for (const x of l) if (!NUMS.includes(x)) { NUMS.push(x); nuevos++; if (dudosos.includes(x)) DUD.push(x); }
+        // si en esta foto salió seguro, deja de ser dudoso
+        DUD = DUD.filter(x => !(l.includes(x) && !dudosos.includes(x)));
       } catch (e) { estado('⚠ ' + e.message, true); }
     }
+    rarosPorPrefijo().forEach(n => { if (!DUD.includes(n)) DUD.push(n); });
     guardar(); pintarFotos();
-    if (!leidos) { estado('⚠ No encontré números. Probá otra foto más cerca y sin reflejo, o escribilo.', true); pintar(); return; }
-    estado('✓ ' + nuevos + ' nuevo' + (nuevos === 1 ? '' : 's') + (leidos > nuevos ? ' · ' + (leidos - nuevos) + ' ya estaban' : '') + ' · buscando…');
+    if (!leidos) { estado(aviso + '⚠ No encontré números. Probá otra foto más cerca y sin reflejo, o escribilo.', true); pintar(); return; }
+    estado(aviso + '✓ ' + nuevos + ' nuevo' + (nuevos === 1 ? '' : 's') + (leidos > nuevos ? ' · ' + (leidos - nuevos) + ' ya estaban' : '') + ' · buscando…');
     await buscar();
   });
 }
@@ -216,7 +247,7 @@ $('#borrarFoto').onclick = () => {
   const deOtras = new Set(FOTOS.filter((_, i) => i !== fotoAbierta).flatMap(x => x.ids || []));
   const quitar = (f.ids || []).filter(n => !deOtras.has(n));
   if (!confirm('¿Quitar esta foto' + (quitar.length ? ' y sus ' + quitar.length + ' número' + (quitar.length === 1 ? '' : 's') : '') + '?')) return;
-  NUMS = NUMS.filter(n => !quitar.includes(n));
+  NUMS = NUMS.filter(n => !quitar.includes(n)); DUD = DUD.filter(n => !quitar.includes(n));
   FOTOS.splice(fotoAbierta, 1); guardar();
   $('#grande').style.display = 'none'; pintarFotos(); pintar();
 };
@@ -265,13 +296,13 @@ function diaTxt(t) {
   return n === 0 ? 'Hoy' : n === 1 ? 'Ayer' : DIAS[d.getDay()] + ' ' + d.getDate() + ' ' + MES[d.getMonth()];
 }
 function colorProv(s) { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return 'hsl(' + h + ',55%,40%)'; }
-const NOFIG = 'No figura', DEVS = 'Devoluciones';
-function grupoDe(n) { const x = INFO[n] || {}; return x.prov || (esDev(n) ? DEVS : x.t ? 'Sin proveedor' : NOFIG); }
-const colorDe = (g) => g === NOFIG ? '#c62828' : g === DEVS ? '#8d6e63' : g === 'Sin proveedor' ? '#78909c' : colorProv(g);
+const NOFIG = 'No figura', DEVS = 'Devoluciones', REV = '⚠ Revisar';
+function grupoDe(n) { if (DUD.includes(n)) return REV; const x = INFO[n] || {}; return x.prov || (esDev(n) ? DEVS : x.t ? 'Sin proveedor' : NOFIG); }
+const colorDe = (g) => g === REV ? '#e65100' : g === NOFIG ? '#c62828' : g === DEVS ? '#8d6e63' : g === 'Sin proveedor' ? '#78909c' : colorProv(g);
 function grupos() {
   const m = new Map();
   for (const n of NUMS) { const g = grupoDe(n); if (!m.has(g)) m.set(g, []); m.get(g).push(n); }
-  const ult = (g) => g === NOFIG ? 3 : g === DEVS ? 2 : g === 'Sin proveedor' ? 1 : 0;
+  const ult = (g) => g === REV ? -1 : g === NOFIG ? 3 : g === DEVS ? 2 : g === 'Sin proveedor' ? 1 : 0;
   return [...m.entries()].sort((a, b) => ult(a[0]) - ult(b[0]) || b[1].length - a[1].length)
     .map(([g, l]) => [g, l.sort((a, b) => ((INFO[b] || {}).t || 0) - ((INFO[a] || {}).t || 0))]);
 }
@@ -284,17 +315,30 @@ function pintar() {
     '<div class="resumen">' + gs.map(([g, l]) => '<span class="chip" style="background:' + colorDe(g) + '">' + esc(g) + '<b>' + l.length + '</b></span>').join('') + '</div>' +
     gs.map(([g, l]) => '<div class="tit"><i style="background:' + colorDe(g) + '"></i>' + esc(g) + ' · ' + l.length + '</div>' +
       l.map(n => { const x = INFO[n] || {};
-        return '<div class="fila' + (x.t ? '' : ' no') + '"><span class="n">' + n + '</span><span class="h">' +
+        const dud = DUD.includes(n);
+        return '<div class="fila' + (x.t ? '' : ' no') + (dud ? ' dud' : '') + '"><span class="n" data-ed="' + n + '">' + n + '</span>' +
+          (dud ? '<button class="si" data-si="' + n + '">✓ Está bien</button>' : '') + '<span class="h">' +
           (x.t ? '<b>' + diaTxt(x.t) + '</b> ' + hhmm(x.t) : x.prov ? 'sin hora' : 'no escaneado') +
           '</span><button class="x" data-x="' + n + '" title="Quitar">✕</button></div>'; }).join('')).join('');
 }
-$('#res').onclick = (e) => {
-  const n = e.target.dataset.x; if (!n) return;
-  NUMS = NUMS.filter(x => x !== n); guardar(); pintar();
+$('#res').onclick = async (e) => {
+  const d = e.target.dataset;
+  if (d.x) { NUMS = NUMS.filter(x => x !== d.x); guardar(); pintar(); return; }
+  if (d.si) { DUD = DUD.filter(x => x !== d.si); guardar(); pintar(); return; }
+  if (d.ed) {                                       // tocar el número = corregirlo
+    const v = prompt('Corregí el número (mirá la foto):', d.ed);
+    if (v == null) return;
+    const l = extraer(v.replace(/\s/g, ''));
+    if (!l.length) { alert('No es un número válido (11 dígitos que empiezan con 4, o M + 10 dígitos + MLA).'); return; }
+    const i = NUMS.indexOf(d.ed);
+    NUMS.splice(i, 1, ...l.filter(x => !NUMS.includes(x) || x === d.ed));
+    DUD = DUD.filter(x => x !== d.ed); delete INFO[d.ed];
+    guardar(); pintar(); await buscar();
+  }
 };
 function textoCompartir() {
   return '📦 Faltantes: ' + NUMS.length + '\n' + grupos().map(([g, l]) => '\n*' + g + '* (' + l.length + ')\n' +
-    l.map(n => { const x = INFO[n] || {}; return n + (x.t ? ' · ' + diaTxt(x.t) + ' ' + hhmm(x.t) : ''); }).join('\n')).join('\n');
+    l.map(n => { const x = INFO[n] || {}; return n + (DUD.includes(n) ? ' (¿?)' : '') + (x.t ? ' · ' + diaTxt(x.t) + ' ' + hhmm(x.t) : ''); }).join('\n')).join('\n');
 }
 $('#compartir').onclick = async () => {
   if (!NUMS.length) return;
@@ -304,10 +348,11 @@ $('#compartir').onclick = async () => {
 };
 $('#nueva').onclick = () => {
   if (NUMS.length && !confirm('¿Empezar una lista nueva? Se borran los números y las fotos.')) return;
-  NUMS = []; INFO = {}; FOTOS = []; guardar(); pintarFotos(); pintar(); estado('');
+  NUMS = []; INFO = {}; FOTOS = []; DUD = []; guardar(); pintarFotos(); pintar(); estado('');
 };
 function guardar() {
-  ls.set('flt-nums', NUMS); ls.set('flt-info', INFO);
+  DUD = DUD.filter(n => NUMS.includes(n));
+  ls.set('flt-nums', NUMS); ls.set('flt-info', INFO); ls.set('flt-dud', DUD);
   // las fotos ocupan: si no entran en el celu, se guardan solo las últimas
   let f = FOTOS.map(x => ({ src: x.src, n: x.n, ids: x.ids }));
   while (f.length) { try { localStorage.setItem('flt-fotos', JSON.stringify(f)); break; } catch (_) { f = f.slice(1); } }
