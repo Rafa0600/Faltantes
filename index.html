@@ -47,7 +47,9 @@
   .fila.dud .n { color:#e65100; text-decoration:underline dotted; }
   .fila .si { border:0; background:#e65100; color:#fff; border-radius:8px; padding:4px 8px; font:700 12px system-ui,sans-serif; }
   .fila .n { cursor:pointer; }
-  .fila .x { border:0; background:none; color:#9ca3af; font-size:16px; padding:2px 4px; }
+  .fila .x { border:0; background:#e8f5e9; color:#2e7d32; border-radius:8px; padding:5px 8px; font:700 12px system-ui,sans-serif; white-space:nowrap; }
+  #deshacer { white-space:nowrap; max-width:92vw; position:fixed; left:50%; transform:translateX(-50%); bottom:calc(76px + env(safe-area-inset-bottom)); background:#263238; color:#fff; border-radius:12px; padding:10px 14px; display:none; gap:12px; align-items:center; z-index:15; font-size:14px; box-shadow:0 4px 14px rgba(0,0,0,.3); }
+  #deshacer button { border:0; background:none; color:#ffe600; font:700 14px system-ui,sans-serif; }
   .vacio { color:var(--mut); text-align:center; padding:14px 0 4px; font-size:14px; }
   .pie { position:fixed; left:0; right:0; bottom:0; background:rgba(242,243,245,.96); padding:10px 16px calc(10px + env(safe-area-inset-bottom)); display:flex; gap:8px; justify-content:center; border-top:1px solid var(--bd); }
   .pie button { max-width:290px; flex:1; border:0; border-radius:12px; padding:13px; font:700 15px system-ui,sans-serif; }
@@ -71,7 +73,8 @@
   <div class="barra" id="barra"><div></div></div>
   <div class="card" id="res"><div class="vacio">Sacale foto a la lista de faltantes. Podés sacar varias: los números repetidos no se suman dos veces.</div></div>
 </main>
-<div class="pie"><button class="gris" id="nueva">🗑 Nueva</button><button class="ok" id="compartir">📤 Compartir</button></div>
+<div class="pie"><button class="gris" id="nueva">🗑 Borrar todo</button><button class="ok" id="compartir">📤 Compartir</button></div>
+<div id="deshacer"><span></span><button>Deshacer</button></div>
 <div id="grande"><img alt=""><button id="borrarFoto" style="left:12px;background:#c62828;color:#fff">🗑 Quitar foto</button><button id="cerrarG" style="right:12px;background:#fff">✕ Cerrar</button></div>
 
 <script>
@@ -88,6 +91,56 @@ let NUMS = ls.get('flt-nums', []);          // envíos y devoluciones, en orden
 let INFO = ls.get('flt-info', {});          // id → {t, r, prov} de la nube
 let FOTOS = ls.get('flt-fotos', []);        // [{src (jpg chico), n}]
 let DUD = ls.get('flt-dud', []);            // leídos en una sola lectura: a revisar con la foto
+let AGREG = ls.get('flt-agreg', {});        // id → cuándo se anotó (de la nube)
+// La LISTA vive en la nube (igual en todos los celus). Lo que se cambia sin conexión queda en "pend" y se manda después.
+const API_LISTA = 'https://mikra-historial.rafaelassir.workers.dev/api/places/flt';
+let PEND = ls.get('flt-pend', { agregar: [], quitar: [], seguro: [] });
+let SYNC = { ok: 0, err: '' };
+function encolar(tipo, items) {
+  for (const it of items) {
+    const id = typeof it === 'string' ? it : it.id;
+    if (tipo === 'agregar') { PEND.quitar = PEND.quitar.filter(x => x !== id); if (!PEND.agregar.some(x => x.id === id)) PEND.agregar.push(it); }
+    if (tipo === 'quitar') { PEND.agregar = PEND.agregar.filter(x => x.id !== id); PEND.seguro = PEND.seguro.filter(x => x !== id); if (!PEND.quitar.includes(id)) PEND.quitar.push(id); }
+    if (tipo === 'seguro' && !PEND.seguro.includes(id)) PEND.seguro.push(id);
+  }
+  ls.set('flt-pend', PEND);
+  sincronizar();
+}
+let sincronizando = null, vaciarPend = false;
+function sincronizar() {
+  if (sincronizando) return sincronizando.then(() => sincronizar());
+  return sincronizando = (async () => {
+    if (!clave()) return;
+    const body = { agregar: [...PEND.agregar], quitar: [...PEND.quitar], seguro: [...PEND.seguro], vaciar: vaciarPend || undefined };
+    const hay = vaciarPend || PEND.agregar.length || PEND.quitar.length || PEND.seguro.length;
+    try {
+      const r = await fetch(API_LISTA, { method: hay ? 'POST' : 'GET', headers: { 'X-Clave': clave(), 'Content-Type': 'application/json' }, body: hay ? JSON.stringify(body) : undefined });
+      if (r.status === 401) { ls.set('flt-clave', ''); throw new Error('Clave incorrecta. Tocá ⚙ y ponela de nuevo.'); }
+      const j = await r.json(); if (!j.ok) throw new Error(j.error || 'error');
+      // lo mandado ya está en la nube: se saca de pendientes (lo que se agregó mientras tanto queda)
+      PEND.agregar = PEND.agregar.filter(x => !body.agregar.some(y => y.id === x.id));
+      PEND.quitar = PEND.quitar.filter(x => !body.quitar.includes(x));
+      PEND.seguro = PEND.seguro.filter(x => !body.seguro.includes(x));
+      if (body.vaciar) vaciarPend = false;
+      ls.set('flt-pend', PEND);
+      const antes = NUMS.join();
+      AGREG = {}; j.lista.forEach(x => { AGREG[x.id] = x.agregado; });
+      NUMS = j.lista.map(x => x.id).filter(id => !PEND.quitar.includes(id)).concat(PEND.agregar.map(x => x.id).filter(id => !AGREG[id]));
+      DUD = j.lista.filter(x => x.dud && !PEND.seguro.includes(x.id)).map(x => x.id).concat(PEND.agregar.filter(x => x.dud).map(x => x.id));
+      SYNC = { ok: Date.now(), err: '' };
+      guardar();
+      if (NUMS.join() !== antes) { pintar(); if (NUMS.some(n => !(INFO[n] || {}).t)) buscar(); } else pintarSync();
+    } catch (e) { SYNC.err = e.message === 'Failed to fetch' ? 'sin conexión' : e.message; pintarSync(); }
+    finally { sincronizando = null; }
+  })();
+}
+function pintarSync() {
+  const el = $('#sync'); if (!el) return;
+  const pend = PEND.agregar.length + PEND.quitar.length + PEND.seguro.length;
+  el.textContent = SYNC.err ? '⚠ ' + SYNC.err + (pend ? ' · ' + pend + ' cambio' + (pend === 1 ? '' : 's') + ' sin subir' : '')
+    : pend ? '☁ Subiendo…' : SYNC.ok ? '☁ Igual en todos los celus' : '';
+  el.style.color = SYNC.err ? 'var(--mal)' : 'var(--mut)';
+}
 const esValido = (n) => /^4\d{10}$/.test(n) || /^M\d{10}MLA$/.test(n);
 const esDev = (n) => n[0] === 'M';
 
@@ -204,24 +257,20 @@ function leerFotos(files) {
   files = [...files]; if (!files.length) return;
   cola = cola.then(async () => {
     // una lista de hace más de 2 horas es de otra colecta: se empieza de cero (si no, se mezclaban)
-    let aviso = '';
-    const ult = ls.get('flt-ult', 0);
-    if (NUMS.length && Date.now() - ult > 2 * 3600000) {
-      NUMS = []; INFO = {}; FOTOS = []; DUD = []; aviso = 'Lista nueva (la anterior era de otra colecta) · ';
-    }
-    ls.set('flt-ult', Date.now());
-    let nuevos = 0, leidos = 0;
+    const aviso = '';
+    let nuevos = 0, leidos = 0; const agregados = [];
     for (let i = 0; i < files.length; i++) {
       try {
         const { l, dudosos } = await leerUna(files[i], i, files.length);
         leidos += l.length;
-        for (const x of l) if (!NUMS.includes(x)) { NUMS.push(x); nuevos++; if (dudosos.includes(x)) DUD.push(x); }
+        for (const x of l) if (!NUMS.includes(x)) { NUMS.push(x); nuevos++; if (dudosos.includes(x)) DUD.push(x); agregados.push({ id: x, dud: dudosos.includes(x) ? 1 : 0 }); }
         // si en esta foto salió seguro, deja de ser dudoso
         DUD = DUD.filter(x => !(l.includes(x) && !dudosos.includes(x)));
       } catch (e) { estado('⚠ ' + e.message, true); }
     }
-    rarosPorPrefijo().forEach(n => { if (!DUD.includes(n)) DUD.push(n); });
+    rarosPorPrefijo().forEach(n => { if (!DUD.includes(n)) { DUD.push(n); const a = agregados.find(x => x.id === n); if (a) a.dud = 1; } });
     guardar(); pintarFotos();
+    if (agregados.length) encolar('agregar', agregados);
     if (!leidos) { estado(aviso + '⚠ No encontré números. Probá otra foto más cerca y sin reflejo, o escribilo.', true); pintar(); return; }
     estado(aviso + '✓ ' + nuevos + ' nuevo' + (nuevos === 1 ? '' : 's') + (leidos > nuevos ? ' · ' + (leidos - nuevos) + ' ya estaban' : '') + ' · buscando…');
     await buscar();
@@ -248,7 +297,7 @@ $('#borrarFoto').onclick = () => {
   const quitar = (f.ids || []).filter(n => !deOtras.has(n));
   if (!confirm('¿Quitar esta foto' + (quitar.length ? ' y sus ' + quitar.length + ' número' + (quitar.length === 1 ? '' : 's') : '') + '?')) return;
   NUMS = NUMS.filter(n => !quitar.includes(n)); DUD = DUD.filter(n => !quitar.includes(n));
-  FOTOS.splice(fotoAbierta, 1); guardar();
+  FOTOS.splice(fotoAbierta, 1); guardar(); if (quitar.length) encolar('quitar', quitar);
   $('#grande').style.display = 'none'; pintarFotos(); pintar();
 };
 
@@ -258,8 +307,8 @@ $('#escribir').onclick = async () => {
   if (!v) return;
   const l = extraer(v.replace(/(\d)\s+(?=\d)/g, '$1'));
   if (!l.length) { estado('⚠ No es un número de envío válido.', true); return; }
-  let n = 0; for (const x of l) if (!NUMS.includes(x)) { NUMS.push(x); n++; }
-  guardar(); estado('✓ ' + n + ' agregado' + (n === 1 ? '' : 's') + ' · buscando…'); await buscar();
+  const nv = l.filter(x => !NUMS.includes(x)); NUMS.push(...nv); const n = nv.length;
+  guardar(); if (nv.length) encolar('agregar', nv.map(id => ({ id, dud: 0 }))); estado('✓ ' + n + ' agregado' + (n === 1 ? '' : 's') + ' · buscando…'); await buscar();
 };
 
 /* ---------- nube ---------- */
@@ -268,7 +317,7 @@ function pedirClave(msg) {
   if (k && k.trim()) { ls.set('flt-clave', k.trim()); return true; }
   return false;
 }
-$('#cfg').onclick = () => { if (pedirClave('Cambiar la clave de la nube:')) buscar(); };
+$('#cfg').onclick = () => { if (pedirClave('Cambiar la clave de la nube:')) { sincronizar(); buscar(); } };
 async function buscar() {
   const ids = NUMS.filter(n => !INFO[n] || !INFO[n].t);   // lo que ya tiene hora no se vuelve a pedir
   if (!NUMS.length) { pintar(); return; }
@@ -307,37 +356,51 @@ function grupos() {
     .map(([g, l]) => [g, l.sort((a, b) => ((INFO[b] || {}).t || 0) - ((INFO[a] || {}).t || 0))]);
 }
 function pintar() {
-  if (!NUMS.length) { $('#res').innerHTML = '<div class="vacio">Sacale foto a la lista de faltantes. Podés sacar varias: los números repetidos no se suman dos veces.</div>'; return; }
+  if (!NUMS.length) { $('#res').innerHTML = '<div class="vacio">' + (SYNC.ok ? '🎉 No queda nada para reclamar.<br>' : '') + 'Sacale foto a la lista de faltantes. Podés sacar varias: los números repetidos no se suman dos veces.</div><div id="sync" style="font-size:12px;text-align:center;margin-top:6px"></div>'; pintarSync(); return; }
   const gs = grupos();
   $('#res').innerHTML =
-    '<div style="display:flex;align-items:baseline;gap:6px;margin-bottom:8px"><b style="font-size:17px">' + NUMS.length + ' faltante' + (NUMS.length === 1 ? '' : 's') + '</b>' +
-      '<span style="color:var(--mut);font-size:13px">· ' + FOTOS.length + ' foto' + (FOTOS.length === 1 ? '' : 's') + '</span></div>' +
+    '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><b style="font-size:30px;line-height:1">' + NUMS.length + '</b>' +
+      '<div style="flex:1;line-height:1.2"><b style="font-size:16px">para reclamar</b><div id="sync" style="font-size:12px"></div></div></div>' +
     '<div class="resumen">' + gs.map(([g, l]) => '<span class="chip" style="background:' + colorDe(g) + '">' + esc(g) + '<b>' + l.length + '</b></span>').join('') + '</div>' +
     gs.map(([g, l]) => '<div class="tit"><i style="background:' + colorDe(g) + '"></i>' + esc(g) + ' · ' + l.length + '</div>' +
       l.map(n => { const x = INFO[n] || {};
         const dud = DUD.includes(n);
-        return '<div class="fila' + (x.t ? '' : ' no') + (dud ? ' dud' : '') + '"><span class="n" data-ed="' + n + '">' + n + '</span>' +
+        return '<div class="fila' + (x.t ? '' : ' no') + (dud ? ' dud' : '') + '"><span class="n" data-ed="' + n + '">' + n +
+          (AGREG[n] ? '<small style="display:block;font:500 11px system-ui,sans-serif;color:var(--mut)">anotado ' + diaTxt(AGREG[n]).toLowerCase() + '</small>' : '') + '</span>' +
           (dud ? '<button class="si" data-si="' + n + '">✓ Está bien</button>' : '') + '<span class="h">' +
           (x.t ? '<b>' + diaTxt(x.t) + '</b> ' + hhmm(x.t) : x.prov ? 'sin hora' : 'no escaneado') +
-          '</span><button class="x" data-x="' + n + '" title="Quitar">✕</button></div>'; }).join('')).join('');
+          '</span><button class="x" data-x="' + n + '" title="Ya llegó: sacar de la lista">✓ Llegó</button></div>'; }).join('')).join('');
+  pintarSync();
 }
 $('#res').onclick = async (e) => {
   const d = e.target.dataset;
-  if (d.x) { NUMS = NUMS.filter(x => x !== d.x); guardar(); pintar(); return; }
-  if (d.si) { DUD = DUD.filter(x => x !== d.si); guardar(); pintar(); return; }
+  if (d.x) {                                        // llegó: sale de la lista (en todos los celus), con deshacer
+    const id = d.x, eraDud = DUD.includes(id);
+    NUMS = NUMS.filter(x => x !== id); guardar(); pintar(); encolar('quitar', [id]);
+    const t = $('#deshacer'); t.querySelector('span').textContent = '✓ …' + id.slice(-4) + ' llegó · quedan ' + NUMS.length;
+    t.style.display = 'flex'; clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = 'none'; }, 6000);
+    t.querySelector('button').onclick = () => { t.style.display = 'none'; NUMS.push(id); if (eraDud) DUD.push(id); guardar(); pintar(); encolar('agregar', [{ id, dud: eraDud ? 1 : 0 }]); };
+    return;
+  }
+  if (d.si) { DUD = DUD.filter(x => x !== d.si); guardar(); pintar(); encolar('seguro', [d.si]); return; }
   if (d.ed) {                                       // tocar el número = corregirlo
     const v = prompt('Corregí el número (mirá la foto):', d.ed);
     if (v == null) return;
     const l = extraer(v.replace(/\s/g, ''));
     if (!l.length) { alert('No es un número válido (11 dígitos que empiezan con 4, o M + 10 dígitos + MLA).'); return; }
     const i = NUMS.indexOf(d.ed);
-    NUMS.splice(i, 1, ...l.filter(x => !NUMS.includes(x) || x === d.ed));
+    const nuevos = l.filter(x => !NUMS.includes(x) || x === d.ed);
+    NUMS.splice(i, 1, ...nuevos);
     DUD = DUD.filter(x => x !== d.ed); delete INFO[d.ed];
-    guardar(); pintar(); await buscar();
+    guardar(); pintar();
+    if (!nuevos.includes(d.ed)) encolar('quitar', [d.ed]);
+    encolar('agregar', nuevos.filter(x => x !== d.ed).map(id => ({ id, dud: 0 })));
+    if (nuevos.includes(d.ed)) encolar('seguro', [d.ed]);
+    await buscar();
   }
 };
 function textoCompartir() {
-  return '📦 Faltantes: ' + NUMS.length + '\n' + grupos().map(([g, l]) => '\n*' + g + '* (' + l.length + ')\n' +
+  return '📦 Faltantes para reclamar: ' + NUMS.length + '\n' + grupos().map(([g, l]) => '\n*' + g + '* (' + l.length + ')\n' +
     l.map(n => { const x = INFO[n] || {}; return n + (DUD.includes(n) ? ' (¿?)' : '') + (x.t ? ' · ' + diaTxt(x.t) + ' ' + hhmm(x.t) : ''); }).join('\n')).join('\n');
 }
 $('#compartir').onclick = async () => {
@@ -347,12 +410,13 @@ $('#compartir').onclick = async () => {
   try { await navigator.clipboard.writeText(t); estado('✓ Copiado'); } catch (_) { prompt('Copiá:', t); }
 };
 $('#nueva').onclick = () => {
-  if (NUMS.length && !confirm('¿Empezar una lista nueva? Se borran los números y las fotos.')) return;
-  NUMS = []; INFO = {}; FOTOS = []; DUD = []; guardar(); pintarFotos(); pintar(); estado('');
+  if (NUMS.length && !confirm('¿Borrar TODA la lista de faltantes?\n\nSe borra en todos los celus (son ' + NUMS.length + ' para reclamar). Si solo llegó alguno, mejor tocá «✓ Llegó» en ese.')) return;
+  NUMS = []; INFO = {}; FOTOS = []; DUD = []; PEND = { agregar: [], quitar: [], seguro: [] }; vaciarPend = true;
+  guardar(); pintarFotos(); pintar(); estado(''); sincronizar();
 };
 function guardar() {
   DUD = DUD.filter(n => NUMS.includes(n));
-  ls.set('flt-nums', NUMS); ls.set('flt-info', INFO); ls.set('flt-dud', DUD);
+  ls.set('flt-nums', NUMS); ls.set('flt-info', INFO); ls.set('flt-dud', DUD); ls.set('flt-agreg', AGREG);
   // las fotos ocupan: si no entran en el celu, se guardan solo las últimas
   let f = FOTOS.map(x => ({ src: x.src, n: x.n, ids: x.ids }));
   while (f.length) { try { localStorage.setItem('flt-fotos', JSON.stringify(f)); break; } catch (_) { f = f.slice(1); } }
@@ -366,8 +430,17 @@ window.addEventListener('appinstalled', () => { $('#instalar').hidden = true; })
 $('#instalar').onclick = async () => { if (!pedidoInstalar) return; pedidoInstalar.prompt(); await pedidoInstalar.userChoice; pedidoInstalar = null; $('#instalar').hidden = true; };
 
 FOTOS.forEach(f => { f.leyendo = false; });
+if (!ls.get('flt-subido', false)) {
+  if (NUMS.length) encolar('agregar', NUMS.map(id => ({ id, dud: DUD.includes(id) ? 1 : 0 })));
+  ls.set('flt-subido', true);
+}
 pintarFotos(); pintar();
+if (!clave()) pedirClave();
+sincronizar();
 if (NUMS.some(n => !(INFO[n] || {}).t) && clave()) buscar();
+// al volver a la app y cada 15 s: trae lo que se borró/agregó en otro celu
+document.addEventListener('visibilitychange', () => { if (!document.hidden) sincronizar(); });
+setInterval(() => { if (!document.hidden) sincronizar(); }, 15000);
 </script>
 </body>
 </html>
